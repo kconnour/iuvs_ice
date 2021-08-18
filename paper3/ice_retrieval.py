@@ -1,4 +1,9 @@
-"""Find the UV single scattering albedo from the MY34 GDS
+"""Retrieve ice and dust optical depths from a specified IUVS data file.
+
+This is structured like:
+- All the things that are constant in an observation
+- All things that are constant in a pixel
+- All the things that change each iteration of the solver
 """
 # Built-in imports
 import glob
@@ -14,7 +19,7 @@ import disort
 from pyrt.observation import constant_width, phase_to_angles
 from pyrt.eos import Hydrostatic
 from pyrt.rayleigh import RayleighCO2
-from pyrt.aerosol import Conrath, ForwardScattering, OpticalDepth, \
+from pyrt.aerosol import ForwardScattering, OpticalDepth, \
     TabularLegendreCoefficients
 from pyrt.atmosphere import Atmosphere
 from pyrt.controller import ComputationalParameters, ModelBehavior
@@ -24,6 +29,11 @@ from pyrt.surface import Surface
 
 # Local imports
 from paper3.txt_data import L1CTxt, L2Txt
+from paper3.gcm import load_simulation
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Load in files I need once per observation file
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Observation
@@ -33,9 +43,9 @@ ff = np.load(os.path.join(os.path.dirname(__file__), 'mvn_iuv_flatfield.npy'), a
 flatfield = ff['flatfield']
 wavelengths = ff['wavelengths'] / 1000  # convert to microns
 
-# Choose the files I want to retrieve here. Designed for Ubuntu
-l1c_files = sorted(glob.glob('/media/kyle/Samsung_T5/l1ctxt/orbit03400/*3453*'))
-l2_files = sorted(glob.glob('/media/kyle/Samsung_T5/l2txt/orbit03400/*3453*'))
+# Choose the files I want to retrieve here. Designed for Mac
+l1c_files = sorted(glob.glob('/Volumes/Samsung_T5/l1ctxt/orbit03400/*3453*'))
+l2_files = sorted(glob.glob('/Volumes/Samsung_T5/l2txt/orbit03400/*3453*'))
 l1c_file = L1CTxt(l1c_files[0])
 l2_file = L2Txt(l2_files[0])
 
@@ -53,133 +63,126 @@ l1c_file.solar_zenith_angle = np.where(l1c_file.solar_zenith_angle >= 90, 90, l1
 angles = phase_to_angles(l1c_file.solar_zenith_angle, l1c_file.emission_angle, l1c_file.phase_angle)
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# Make the equation of state variables on a custom grid
+# Load whatever files possible
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-aux_files_path = '/home/kyle/dustssa/kyle_iter2_radprop'
-z_boundaries = np.linspace(80, 0, num=15)    # Define the boundaries to use
-eos_file = np.flipud(np.load(os.path.join('/home/kyle/repos/pyuvs-rt/data/marsatm.npy')))
+z_boundaries = np.linspace(80, 0, num=15)  # Define the boundaries to use
+gcm_simulation = load_simulation(l1c_file, '/Volumes/Samsung_T5')
+pinterp = gcm_simulation.make_4d_interpolator(gcm_simulation.pressure)
+tinterp = gcm_simulation.make_4d_interpolator(gcm_simulation.temperature)
+dinterp = gcm_simulation.make_4d_interpolator(gcm_simulation.aerosol)
 
+# TODO: load in dust and ice fsp and pf files here
 
-
-# NEED TO sue Franck's surface pressure from the model
-eos_file[:, 1] *= 610 / eos_file[-1, 1]
-# Construct the EoS profiles
-# Use T profile from Kass et al 2019
-eos_file[:, 2] = np.flip(np.array(
-    [230, 230, 230, 230, 230, 230, 230, 230, 230, 230,
-     230, 230, 230, 230, 230, 228, 226, 224, 222, 220,
-     214, 208, 202, 196, 190, 186, 182, 178, 174, 170,
-     166, 164, 158, 154, 150, 150, 150, 150, 150, 150,
-     150]))
-mass = 7.3 * 10**-26
-gravity = 3.7
-
-hydro = Hydrostatic(eos_file[:, 0], eos_file[:, 1], eos_file[:, 2],
-                    z_boundaries, mass, gravity)
-
-###########################
-# Aerosol things
-###########################
-# Rayleigh scattering
-rco2 = RayleighCO2(wavelengths, hydro.column_density)
-rayleigh_info = (rco2.optical_depth, rco2.single_scattering_albedo,
-                 rco2.phase_function)
-
-# Dust vertical profile
-z_midpoint = ((z_boundaries[:-1] + z_boundaries[1:]) / 2)
-q0 = 1
-H = 10
-nu = 0.01
-
-conrath = Conrath(z_midpoint, q0, H, nu)
-dust_profile = conrath.profile
-
-# Read in the dust properties
-cext = np.load(os.path.join(aux_files_path, 'cext_lut.npy'))
-csca = np.load(os.path.join(aux_files_path, 'csca_lut.npy'))
-fsp_wavs = np.array([0.23, 0.26, 0.28, 0.3])
-fsp_psizes = np.array([1.4, 1.6, 1.8, 2])
-
-# TODO: modify this each run
-pgrad = np.linspace(2, 2, num=len(z_boundaries) - 1)
-wave_ref = 0.88
-
-# Read in the dust phase function
-phsfn = np.load(os.path.join(aux_files_path, 'phsfn_coeff.npy'))
-pf_wavs = fsp_wavs
-pf_psizes = fsp_psizes
-
-# Use constant properties over the MUV region
-# fsp_wavs[1] = 0.439
-# pf_wavs[1] = 0.439
-
-# Make the misc things
-cp = ComputationalParameters(hydro.n_layers, 65, 16, 1, 1, 80)
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Miscellaneous variables
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~
+cp = ComputationalParameters(len(z_boundaries) - 1, 65, 16, 1, 1, 80)
 mb = ModelBehavior()
 flux = IncidentFlux()
 te = ThermalEmission()
 ob = OutputBehavior()
 ulv = UserLevel(cp.n_user_levels)
 
-# Surface treatment
-# Use Todd Clancy's surface
-clancy_lamber = np.interp(wavelengths, np.linspace(0.2, 0.33, num=100),
-                          np.linspace(0.01, 0.015, num=100))
-lamb = [Surface(w, cp.n_streams, cp.n_polar, cp.n_azimuth, ob.user_angles,
+
+def retrieve_pixel(position: int, integration: int):
+    if l1c_file.solar_zenith_angle[integration, position] >= 72 or \
+       l1c_file.emission_angle[integration, position] >= 72:
+        return
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Make the equation of state variables on a custom grid
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    inp = []
+    for i in range(len(z_boundaries)):
+        inp.append([l1c_file.local_time[integration, position],
+                    z_boundaries[i],
+                    l1c_file.latitude[integration, position, 4],
+                    l1c_file.longitude[integration, position, 4]])
+
+    inp = np.array(inp)
+    pressure = pinterp(inp)
+    temperature = tinterp(inp)
+    # RegularGridInterpolator *precludes* the need for the original
+    # altitudes since it just interpolates them onto the new alt grid.
+
+    pressure = np.where(pressure < 0, 0.000001, pressure)
+    temperature = np.where(temperature < 0, 0.000001, temperature)
+    mass = 7.3 * 10**-26
+    gravity = 3.7
+
+    hydro = Hydrostatic(z_boundaries, pressure, temperature,
+                        z_boundaries, mass, gravity)
+
+    ###########################
+    # Aerosol things
+    ###########################
+    # Rayleigh scattering
+    rco2 = RayleighCO2(wavelengths, hydro.column_density)
+    rayleigh_info = (rco2.optical_depth, rco2.single_scattering_albedo,
+                     rco2.phase_function)
+
+    # Set the dust vertical profile
+    dust_profile = dinterp(inp)
+
+    # Set the ice vertical profile
+    exp_prof = np.exp(-z_boundaries / 10)    # 10km scale height
+    ice_prof = np.where(z_boundaries < 20, 0, exp_prof)
+
+    ###########################
+    # Surface setup
+    ###########################
+    # Use Todd Clancy's surface
+    # I do this on a per pixel bases cause I'm not sure if changing a
+    # Surface to Hapke will cause problems.
+    clancy_lamber = np.interp(wavelengths, np.linspace(0.2, 0.33, num=100),
+                              np.linspace(0.01, 0.015, num=100))
+    lamb = [Surface(w, cp.n_streams, cp.n_polar, cp.n_azimuth, ob.user_angles,
                 ob.only_fluxes) for w in clancy_lamber]
 
-# Make a Lambert surface. If I want a Hapke surface, that needs to be done in
-# retrieve_ssa
-#for l in lamb:
-#    l.make_lambertian()
-
-
-def retrieve_ssa(ssa_guess, pixel_index):
-    # Skip the retrieval if the pixel quantities aren't good
-    answer = np.zeros(19)
-    if pixel_od[pixel_index] < 5 or solar_zenith_angle[pixel_index] > 72 or \
-            emission_angle[pixel_index] > 72:
-        answer[:] = np.nan
-        print(f'skipping pixel {pixel_index}')
-        return pixel_index, answer
+    oa = OutputArrays(cp.n_polar, cp.n_user_levels, cp.n_azimuth)
 
     # Make a Hapke surface
     for index, l in enumerate(lamb):
-        wolff_hapke = np.interp(wavelengths, np.linspace(0.258, 0.32, num=100),
+        wolff_hapke = np.interp(wavelengths,
+                                np.linspace(0.258, 0.32, num=100),
                                 np.linspace(0.07, 0.095, num=100))
-        l.make_hapkeHG2_roughness(0.8, 0.06, wolff_hapke[index], 0.3, 0.45, 20,
-                                  angles.mu[pixel_index],
-                                  angles.mu0[pixel_index],
-                                  angles.phi[pixel_index],
-                                  angles.phi0[pixel_index], flux.beam_flux)
+        l.make_hapkeHG2_roughness(0.8, 0.06, wolff_hapke[index], 0.3,
+                                  0.45, 20,
+                                  angles.mu[position, integration],
+                                  angles.mu0[position, integration],
+                                  angles.phi[position, integration],
+                                  angles.phi0[position, integration],
+                                  flux.beam_flux)
 
-    def fit_ssa(guess, wav_index: int):
+    def fit_tau(guess: np.ndarray, wav_index: int):
+        dust_guess = guess[0]
+        ice_guess = guess[1]
+
         # Trap the guess
-        if not 0 <= guess <= 1:
-            return 9999999
-        test_cext = np.copy(cext)
-        test_csca = np.copy(csca)
+        if not 0 <= dust_guess <= 1:
+            return 999999
+        if not 0 <= ice_guess <= 2:
+            return 999999
 
-        # BECAUSE I'm using NN, just set all of the coefficients to be my guess
-        # test_csca[:, wav_index] = guess * test_cext[:, wav_index]
-        test_csca = guess * test_cext
-
-        fs = ForwardScattering(test_csca, test_cext, fsp_psizes, fsp_wavs,
-                               pgrad, wavelengths, wave_ref)
+        # TODO: Make dust fsp and pf
+        dust_fs = ForwardScattering(test_csca, test_cext, fsp_psizes,
+                               fsp_wavs, pgrad, wavelengths, wavelengths[wav_index])
         fs.make_nn_properties()
 
-        od = OpticalDepth(dust_profile, hydro.column_density, fs.extinction,
+        od = OpticalDepth(dust_profile, hydro.column_density,
+                          fs.extinction,
                           pixel_od[pixel_index])
 
-        tlc = TabularLegendreCoefficients(phsfn, pf_psizes, pf_wavs, pgrad,
+        tlc = TabularLegendreCoefficients(phsfn, pf_psizes, pf_wavs,
+                                          pgrad,
                                           wavelengths)
         tlc.make_nn_phase_function()
 
         dust_info = (od.total, fs.single_scattering_albedo, tlc.phase_function)
 
-        model = Atmosphere(rayleigh_info, dust_info)
+        # TODO: Make the ice fsp and pf
+        ice_info = (0, 0, 0)
 
-        oa = OutputArrays(cp.n_polar, cp.n_user_levels, cp.n_azimuth)
+        model = Atmosphere(rayleigh_info, dust_info, ice_info)
 
         rfldir, rfldn, flup, dfdt, uavg, uu, albmed, trnmed = \
             disort.disort(ob.user_angles, ob.user_optical_depths,
@@ -191,40 +194,59 @@ def retrieve_ssa(ssa_guess, pixel_index):
                           model.single_scattering_albedo[:, wav_index],
                           model.legendre_moments[:, :, wav_index],
                           hydro.temperature, spectral.low_wavenumber,
-                          spectral.high_wavenumber, ulv.optical_depth_output,
-                          angles.mu0[pixel_index], angles.phi0[pixel_index],
-                          angles.mu[pixel_index], angles.phi[pixel_index],
+                          spectral.high_wavenumber,
+                          ulv.optical_depth_output,
+                          angles.mu0[pixel_index],
+                          angles.phi0[pixel_index],
+                          angles.mu[pixel_index],
+                          angles.phi[pixel_index],
                           flux.beam_flux, flux.isotropic_flux,
                           lamb[wav_index].albedo, te.bottom_temperature,
                           te.top_temperature, te.top_emissivity,
-                          mb.radius, hydro.scale_height, lamb[wav_index].rhoq,
-                          lamb[wav_index].rhou, lamb[wav_index].rho_accurate,
+                          mb.radius, hydro.scale_height,
+                          lamb[wav_index].rhoq,
+                          lamb[wav_index].rhou,
+                          lamb[wav_index].rho_accurate,
                           lamb[wav_index].bemst, lamb[wav_index].emust,
                           mb.accuracy, mb.header, oa.direct_beam_flux,
                           oa.diffuse_down_flux, oa.diffuse_up_flux,
-                          oa.flux_divergence, oa.mean_intensity, oa.intensity,
+                          oa.flux_divergence, oa.mean_intensity,
+                          oa.intensity,
                           oa.albedo_medium, oa.transmissivity_medium)
-        return (uu[0, 0, 0] - reflectance[pixel_index, wav_index])**2
+        return (uu[0, 0, 0] - l1c_file.reflectance[integration, position, wav_index]) ** 2
 
-    for wavelength in range(19):
-        fitted_ssa = optimize.minimize(fit_ssa, np.array([ssa_guess]),
-                                       wavelength, method='Nelder-Mead').x
-        print(f'Got an answer of {fitted_ssa}')
-        answer[wavelength] = fitted_ssa
-    return pixel_index, answer
+    # Make array to hold the best fit solution
+    answer = np.zeros((2, 19))
+
+    for wavelength_index in range(19):
+        # skip the ozone wavelengths
+        if 5 <= wavelength_index <= 14:
+            continue
+
+        # Guess 0.5 for tau dust and 1 for tau ice
+        fitted_taus = optimize.minimize(fit_tau, np.array([0.5, 1]),
+                                       args=(wavelength_index,), method='Nelder-Mead').x
+        answer[:, wavelength_index] = fitted_taus
+
+    return integration, position, answer
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Make a shared array
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 memmap_filename = os.path.join(mkdtemp(), 'myNewFile.dat')
-retrieved_ssas = np.memmap(memmap_filename, dtype=float,
-                           shape=reflectance.shape, mode='w+')
+retrieved_dust = np.memmap(memmap_filename, dtype=float,
+                           shape=l1c_file.reflectance.shape, mode='w+')
+retrieved_ice = np.memmap(memmap_filename, dtype=float,
+                           shape=l1c_file.reflectance.shape, mode='w+')
 
 
 def make_answer(inp):
-    # inp must match the above: return pixel_index, answer
-    retrieved_ssas[inp[0], :] = inp[1]
+    integration = inp[0]
+    position = inp[1]
+    answer = inp[2]
+    retrieved_dust[integration, position, :] = answer[0, :]
+    retrieved_ice[integration, position, :] = answer[1, :]
 
 
 t0 = time.time()
@@ -233,11 +255,13 @@ pool = mp.Pool(7)   # save one just to be safe. Some say it's faster
 
 # NOTE: if there are any issues in the argument of apply_async (here,
 # retrieve_ssa), it'll break out of that and move on to the next iteration.
-for pixel in range(reflectance.shape[0]):
-    pool.apply_async(retrieve_ssa, args=(0.65, pixel), callback=make_answer)
+for integ in range(l1c_file.n_integrations):
+    for posit in range(l1c_file.n_positions):
+        pool.apply_async(retrieve_pixel, args=(integ, posit), callback=make_answer)
 # https://www.machinelearningplus.com/python/parallel-processing-python/
 pool.close()
 pool.join()  # I guess this postpones further code execution until the queue is finished
-np.save('/home/kyle/ssa_retrievals/iteration2/new-fsp_new-pf_hapke-wolff_2-0size.npy', retrieved_ssas)
+np.save('/home/kyle/cloud_retrieals/dust.npy', retrieved_dust)
+np.save('/home/kyle/cloud_retrievals/ice.npy', retrieved_ice)
 t1 = time.time()
 print(t1-t0)
