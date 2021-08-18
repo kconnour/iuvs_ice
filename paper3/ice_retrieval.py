@@ -13,6 +13,7 @@ from tempfile import mkdtemp
 import multiprocessing as mp
 
 # 3rd-party imports
+from astropy.io import fits
 import numpy as np
 from scipy import optimize
 import disort
@@ -43,9 +44,9 @@ ff = np.load(os.path.join(os.path.dirname(__file__), 'mvn_iuv_flatfield.npy'), a
 flatfield = ff['flatfield']
 wavelengths = ff['wavelengths'] / 1000  # convert to microns
 
-# Choose the files I want to retrieve here. Designed for Mac
-l1c_files = sorted(glob.glob('/Volumes/Samsung_T5/l1ctxt/orbit03400/*3453*'))
-l2_files = sorted(glob.glob('/Volumes/Samsung_T5/l2txt/orbit03400/*3453*'))
+# Choose the files I want to retrieve here. Designed for Ubuntu
+l1c_files = sorted(glob.glob('/home/kyle/Samsung_T5/l1ctxt/orbit03400/*3453*'))
+l2_files = sorted(glob.glob('/home/kyle/Samsung_T5/l2txt/orbit03400/*3453*'))
 l1c_file = L1CTxt(l1c_files[0])
 l2_file = L2Txt(l2_files[0])
 
@@ -66,12 +67,16 @@ angles = phase_to_angles(l1c_file.solar_zenith_angle, l1c_file.emission_angle, l
 # Load whatever files possible
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 z_boundaries = np.linspace(80, 0, num=15)  # Define the boundaries to use
-gcm_simulation = load_simulation(l1c_file, '/Volumes/Samsung_T5')
+gcm_simulation = load_simulation(l1c_file, '/media/kyle/Samsung_T5')
 pinterp = gcm_simulation.make_4d_interpolator(gcm_simulation.pressure)
 tinterp = gcm_simulation.make_4d_interpolator(gcm_simulation.temperature)
 dinterp = gcm_simulation.make_4d_interpolator(gcm_simulation.aerosol)
 
-# TODO: load in dust and ice fsp and pf files here
+# TODO: load in dust fsp and pf files here
+ice_fsp = np.load('/home/kyle/repos/iuvs_ice/aux/ice_forwardscat.npy')
+ice_phase = np.load('/home/kyle/repos/iuvs_ice/aux/ice_phase.npy')
+ice_psizes = np.load('/home/kyle/repos/iuvs_ice/aux/ice_psize.npy')
+ice_wavs = np.load('/home/kyle/repos/iuvs_ice/aux/ice_wavs.npy')
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Miscellaneous variables
@@ -180,6 +185,7 @@ def retrieve_pixel(position: int, integration: int):
         dust_info = (od.total, fs.single_scattering_albedo, tlc.phase_function)
 
         # TODO: Make the ice fsp and pf
+
         ice_info = (0, 0, 0)
 
         model = Atmosphere(rayleigh_info, dust_info, ice_info)
