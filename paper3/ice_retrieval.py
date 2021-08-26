@@ -33,10 +33,6 @@ from paper3.txt_data import L1CTxt, L2Txt
 from paper3.gcm import load_simulation
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# Load in files I need once per observation file
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Observation
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Load in the flatfield
@@ -45,10 +41,10 @@ flatfield = ff['flatfield']
 wavelengths = ff['wavelengths'] / 1000  # convert to microns
 
 # Choose the files I want to retrieve here. Designed for Ubuntu
-l1c_files = sorted(glob.glob('/home/kyle/Samsung_T5/l1ctxt/orbit03400/*3453*'))
-l2_files = sorted(glob.glob('/home/kyle/Samsung_T5/l2txt/orbit03400/*3453*'))
-l1c_file = L1CTxt(l1c_files[0])
-l2_file = L2Txt(l2_files[0])
+l1c_files = sorted(glob.glob('/media/kyle/Samsung_T5/l1ctxt/orbit03400/*3453*'))
+l2_files = sorted(glob.glob('/media/kyle/Samsung_T5/l2txt/orbit03400/*3453*'))
+l1c_file = L1CTxt(l1c_files[5])
+l2_file = L2Txt(l2_files[5])
 
 # Flatfield correct
 l1c_file.reflectance /= flatfield
@@ -72,11 +68,30 @@ pinterp = gcm_simulation.make_4d_interpolator(gcm_simulation.pressure)
 tinterp = gcm_simulation.make_4d_interpolator(gcm_simulation.temperature)
 dinterp = gcm_simulation.make_4d_interpolator(gcm_simulation.aerosol)
 
-# TODO: load in dust fsp and pf files here
+# TODO: load in dust fsp pf files here
+# Dust forward scattering
+fsphdul = fits.open('/home/kyle/repos/iuvs_ice/aux/dust_properties.fits')
+dust_fsp = fsphdul['primary'].data[:, :, :2]    # Slice off g
+dust_fsp_psizes = fsphdul['particle_sizes'].data
+dust_fsp_wavs = fsphdul['wavelengths'].data
+
+# Dust phase function
+pfhdul = fits.open('/home/kyle/repos/iuvs_ice/aux/dust_phase_function.fits')
+dust_phase = pfhdul['primary'].data
+dust_pf_psizes = pfhdul['particle_sizes'].data
+dust_pf_wavs = pfhdul['wavelengths'].data
+
+# All ice properties
 ice_fsp = np.load('/home/kyle/repos/iuvs_ice/aux/ice_forwardscat.npy')
 ice_phase = np.load('/home/kyle/repos/iuvs_ice/aux/ice_phase.npy')
+ice_phase = np.moveaxis(ice_phase, -1, 0)
 ice_psizes = np.load('/home/kyle/repos/iuvs_ice/aux/ice_psize.npy')
-ice_wavs = np.load('/home/kyle/repos/iuvs_ice/aux/ice_wavs.npy')
+# ice_wavs = np.load('/home/kyle/repos/iuvs_ice/aux/ice_wavs.npy')
+ice_wavs = ice_fsp[0, :, 0]   # The file was wrong
+
+# Set the particle size profile
+dust_pgrad = np.linspace(1.3, 1.8, num=14)
+ice_pgrad = np.linspace(2, 2, num=14)
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Miscellaneous variables
@@ -89,28 +104,40 @@ ob = OutputBehavior()
 ulv = UserLevel(cp.n_user_levels)
 
 
-def retrieve_pixel(position: int, integration: int):
+def retrieve_pixel(integration: int, position: int):
+    # TODO: add altitude != 0 check
     if l1c_file.solar_zenith_angle[integration, position] >= 72 or \
        l1c_file.emission_angle[integration, position] >= 72:
-        return
+        answer = np.zeros((2, 19)) * np.nan
+        print('skipping this due to SZA or EA')
+        return position, integration, answer
+
+    # Get the pixel altitude.
+    # Suppose the min alt is 18km. This will mean that z boundaries is relative to
+    # the surface, *not* the aeroid. If it's relative to the aeroid, I had a bunch of crap that
+    # scattered light out of the beam and gave garbage.
+    min_alt = gcm_simulation.get_min_alt_at_coord(l1c_file.latitude[integration, position, 4], l1c_file.longitude[integration, position, 4])
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Make the equation of state variables on a custom grid
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     inp = []
     for i in range(len(z_boundaries)):
         inp.append([l1c_file.local_time[integration, position],
-                    z_boundaries[i],
+                    z_boundaries[i] + min_alt,
                     l1c_file.latitude[integration, position, 4],
                     l1c_file.longitude[integration, position, 4]])
 
     inp = np.array(inp)
     pressure = pinterp(inp)
     temperature = tinterp(inp)
+    pressure = np.where(pressure < 0, pressure[-2], pressure)
+    temperature = np.where(temperature < 0, temperature[-2], temperature)
     # RegularGridInterpolator *precludes* the need for the original
     # altitudes since it just interpolates them onto the new alt grid.
 
-    pressure = np.where(pressure < 0, 0.000001, pressure)
-    temperature = np.where(temperature < 0, 0.000001, temperature)
+    # If I do altitude relative to the surface and not the aeroid, these should be unnecessary
+    #pressure = np.where(pressure < 0, 0.000001, pressure)
+    #temperature = np.where(temperature < 0, 0.000001, temperature)
     mass = 7.3 * 10**-26
     gravity = 3.7
 
@@ -126,11 +153,12 @@ def retrieve_pixel(position: int, integration: int):
                      rco2.phase_function)
 
     # Set the dust vertical profile
-    dust_profile = dinterp(inp)
+    dust_profile = dinterp(inp)[1:]
 
     # Set the ice vertical profile
-    exp_prof = np.exp(-z_boundaries / 10)    # 10km scale height
-    ice_prof = np.where(z_boundaries < 20, 0, exp_prof)
+    exp_prof = np.exp(-(z_boundaries + min_alt) / 10)   # 10km scale height
+    junk = np.where(z_boundaries < 20, 0, exp_prof)
+    ice_prof = (junk[1:] + junk[:-1]) / 2
 
     ###########################
     # Surface setup
@@ -158,7 +186,7 @@ def retrieve_pixel(position: int, integration: int):
                                   angles.phi0[position, integration],
                                   flux.beam_flux)
 
-    def fit_tau(guess: np.ndarray, wav_index: int):
+    def fit_tau(guess: np.ndarray, wav_index: int) -> float:
         dust_guess = guess[0]
         ice_guess = guess[1]
 
@@ -168,26 +196,23 @@ def retrieve_pixel(position: int, integration: int):
         if not 0 <= ice_guess <= 2:
             return 999999
 
-        # TODO: Make dust fsp and pf
-        dust_fs = ForwardScattering(test_csca, test_cext, fsp_psizes,
-                               fsp_wavs, pgrad, wavelengths, wavelengths[wav_index])
-        fs.make_nn_properties()
+        # Make the dust FSP and PF
+        dust_fs = ForwardScattering(dust_fsp[:, :, 1], dust_fsp[:, :, 0], dust_fsp_psizes, dust_fsp_wavs, dust_pgrad, wavelengths, wavelengths[wav_index])
+        dust_fs.make_nn_properties()
+        dust_od = OpticalDepth(dust_profile, hydro.column_density, dust_fs.extinction, dust_guess)
+        dust_tlc = TabularLegendreCoefficients(dust_phase, dust_pf_psizes, dust_pf_wavs, dust_pgrad, wavelengths)
+        dust_tlc.make_nn_phase_function()
+        dust_info = (dust_od.total, dust_fs.single_scattering_albedo, dust_tlc.phase_function)
 
-        od = OpticalDepth(dust_profile, hydro.column_density,
-                          fs.extinction,
-                          pixel_od[pixel_index])
+        # Make the ice FSP and PF
+        ice_fs = ForwardScattering(ice_fsp[:, :, 2], ice_fsp[:, :, 1], ice_psizes, ice_wavs, ice_pgrad, wavelengths, wavelengths[wav_index])
+        ice_fs.make_nn_properties()
+        ice_od = OpticalDepth(ice_prof, hydro.column_density, ice_fs.extinction, ice_guess)
+        ice_tlc = TabularLegendreCoefficients(ice_phase, ice_psizes, ice_wavs, ice_pgrad, wavelengths)
+        ice_tlc.make_nn_phase_function()
+        ice_info = (ice_od.total, ice_fs.single_scattering_albedo, ice_tlc.phase_function)
 
-        tlc = TabularLegendreCoefficients(phsfn, pf_psizes, pf_wavs,
-                                          pgrad,
-                                          wavelengths)
-        tlc.make_nn_phase_function()
-
-        dust_info = (od.total, fs.single_scattering_albedo, tlc.phase_function)
-
-        # TODO: Make the ice fsp and pf
-
-        ice_info = (0, 0, 0)
-
+        # Put it all together
         model = Atmosphere(rayleigh_info, dust_info, ice_info)
 
         rfldir, rfldn, flup, dfdt, uavg, uu, albmed, trnmed = \
@@ -202,10 +227,10 @@ def retrieve_pixel(position: int, integration: int):
                           hydro.temperature, spectral.low_wavenumber,
                           spectral.high_wavenumber,
                           ulv.optical_depth_output,
-                          angles.mu0[pixel_index],
-                          angles.phi0[pixel_index],
-                          angles.mu[pixel_index],
-                          angles.phi[pixel_index],
+                          angles.mu0[position, integration],
+                          angles.phi0[position, integration],
+                          angles.mu[position, integration],
+                          angles.phi[position, integration],
                           flux.beam_flux, flux.isotropic_flux,
                           lamb[wav_index].albedo, te.bottom_temperature,
                           te.top_temperature, te.top_emissivity,
@@ -231,7 +256,7 @@ def retrieve_pixel(position: int, integration: int):
 
         # Guess 0.5 for tau dust and 1 for tau ice
         fitted_taus = optimize.minimize(fit_tau, np.array([0.5, 1]),
-                                       args=(wavelength_index,), method='Nelder-Mead').x
+                                       args=(wavelength_index,), method='Nelder-Mead', bounds=((0, 1), (0, 2))).x
         answer[:, wavelength_index] = fitted_taus
 
     return integration, position, answer
@@ -261,13 +286,14 @@ pool = mp.Pool(7)   # save one just to be safe. Some say it's faster
 
 # NOTE: if there are any issues in the argument of apply_async (here,
 # retrieve_ssa), it'll break out of that and move on to the next iteration.
-for integ in range(l1c_file.n_integrations):
+#for integ in range(l1c_file.n_integrations):
+for integ in range(10):  #range(l1c_file.n_integrations):  # test 20 integrations
     for posit in range(l1c_file.n_positions):
         pool.apply_async(retrieve_pixel, args=(integ, posit), callback=make_answer)
 # https://www.machinelearningplus.com/python/parallel-processing-python/
 pool.close()
 pool.join()  # I guess this postpones further code execution until the queue is finished
-np.save('/home/kyle/cloud_retrieals/dust.npy', retrieved_dust)
-np.save('/home/kyle/cloud_retrievals/ice.npy', retrieved_ice)
+np.save('/home/kyle/cloud_retrievals/dust_test.npy', retrieved_dust)
+np.save('/home/kyle/cloud_retrievals/ice_test.npy', retrieved_ice)
 t1 = time.time()
-print(t1-t0)
+print(t1-t0)    # It takes 17.6 hours for 133 positions, 170 integrations

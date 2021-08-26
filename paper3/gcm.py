@@ -29,11 +29,23 @@ class GCMSimulation:
         self.pressure = np.copy(np.flip(file.variables['pressure'][:], axis=2))  # (12, 111, 49, 65)   units of Pascal, where 1 Pa = 0.01 mbar
         self.temperature = np.copy(np.flip(file.variables['temp'][:], axis=2))  # (12, 111, 49, 65)
         self.aerosol = np.copy(np.flip(file.variables['aerosol'][:], axis=2))  # (12, 111, 49, 65)
+        self.min_alt_ind = np.argmax(self.pressure[0, :, :, :], axis=0)
         file.close()
 
     def make_4d_interpolator(self, quantity, method='linear'):
+
         return RegularGridInterpolator((self.time, self.alt, self.lat, self.lon),
                                        quantity, method=method)
+
+    def get_min_alt_at_coord(self, lat, lon):
+        interp = RegularGridInterpolator((self.alt, self.lat, self.lon), self.pressure[0, :, :, :])
+        coords = np.zeros((111, 3))
+        for i in range(111):
+            coords[i, 0] = self.alt[i]
+            coords[i, 1] = lat
+            coords[i, 2] = lon
+        pressure = interp(coords)
+        return np.argmax(pressure, axis=0) - 10   # since alts start at -10
 
 
 def load_simulation(file: L1CTxt, ssd_path: str):
@@ -59,8 +71,7 @@ foo.close()
 '''
 
 if __name__ == '__main__':
-    f = '/Volumes/Samsung_T5/gcm_runs/stats73_A.nc'
+    f = '/media/kyle/Samsung_T5/gcm_runs/stats73_A.nc'
     g = GCMSimulation(f)
-    nd = RegularGridInterpolator((g.time, g.alt, g.lat, g.lon), g.pressure, method='linear')
-    inp = np.array([15, 30.234, 10, -25])
-    print(nd(inp))
+    print(g.get_min_alt_at_coord(18.39, 226-360))
+
