@@ -154,7 +154,7 @@ def retrieve_pixel(integration: int, position: int):
 
     # Set the dust vertical profile
     dust_profile = dinterp(inp)[1:]
-
+    dust_profile = np.where(dust_profile < 0, dust_profile[-2], dust_profile)
     # Set the ice vertical profile
     exp_prof = np.exp(-(z_boundaries + min_alt) / 10)   # 10km scale height
     junk = np.where(z_boundaries < 20, 0, exp_prof)
@@ -190,12 +190,6 @@ def retrieve_pixel(integration: int, position: int):
         dust_guess = guess[0]
         ice_guess = guess[1]
 
-        # Trap the guess
-        if not 0 <= dust_guess <= 1:
-            return 999999
-        if not 0 <= ice_guess <= 2:
-            return 999999
-
         # Make the dust FSP and PF
         dust_fs = ForwardScattering(dust_fsp[:, :, 1], dust_fsp[:, :, 0], dust_fsp_psizes, dust_fsp_wavs, dust_pgrad, wavelengths, wavelengths[wav_index])
         dust_fs.make_nn_properties()
@@ -214,6 +208,11 @@ def retrieve_pixel(integration: int, position: int):
 
         # Put it all together
         model = Atmosphere(rayleigh_info, dust_info, ice_info)
+
+        #print(f'od={model.optical_depth}')
+        #print(f'ssa={model.single_scattering_albedo}')
+        #print(f'pf={model.legendre_moments}')
+
 
         rfldir, rfldn, flup, dfdt, uavg, uu, albmed, trnmed = \
             disort.disort(ob.user_angles, ob.user_optical_depths,
@@ -254,9 +253,10 @@ def retrieve_pixel(integration: int, position: int):
         if 5 <= wavelength_index <= 14:
             continue
 
-        # Guess 0.5 for tau dust and 1 for tau ice
-        fitted_taus = optimize.minimize(fit_tau, np.array([0.5, 1]),
-                                       args=(wavelength_index,), method='Nelder-Mead', bounds=((0, 1), (0, 2))).x
+        # Guess 0.25 for tau dust and 1 for tau ice
+        fitted_taus = optimize.minimize(fit_tau, np.array([0.25, 1]),
+                                       args=(wavelength_index,), method='Nelder-Mead', bounds=((0, 3), (0, 5))).x
+        print(fitted_taus)
         answer[:, wavelength_index] = fitted_taus
 
     return integration, position, answer
@@ -265,10 +265,11 @@ def retrieve_pixel(integration: int, position: int):
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Make a shared array
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-memmap_filename = os.path.join(mkdtemp(), 'myNewFile.dat')
-retrieved_dust = np.memmap(memmap_filename, dtype=float,
+memmap_filename_dust = os.path.join(mkdtemp(), 'myNewFileDust.dat')
+memmap_filename_ice = os.path.join(mkdtemp(), 'myNewFileIce.dat')
+retrieved_dust = np.memmap(memmap_filename_dust, dtype=float,
                            shape=l1c_file.reflectance.shape, mode='w+')
-retrieved_ice = np.memmap(memmap_filename, dtype=float,
+retrieved_ice = np.memmap(memmap_filename_ice, dtype=float,
                            shape=l1c_file.reflectance.shape, mode='w+')
 
 
@@ -287,7 +288,7 @@ pool = mp.Pool(7)   # save one just to be safe. Some say it's faster
 # NOTE: if there are any issues in the argument of apply_async (here,
 # retrieve_ssa), it'll break out of that and move on to the next iteration.
 #for integ in range(l1c_file.n_integrations):
-for integ in range(10):  #range(l1c_file.n_integrations):  # test 20 integrations
+for integ in range(120):  #range(l1c_file.n_integrations):
     for posit in range(l1c_file.n_positions):
         pool.apply_async(retrieve_pixel, args=(integ, posit), callback=make_answer)
 # https://www.machinelearningplus.com/python/parallel-processing-python/
